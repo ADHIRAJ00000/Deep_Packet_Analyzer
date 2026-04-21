@@ -1,0 +1,23 @@
+.DS_Store
+
+# CMake and build outputs
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# Compiled binaries and objects
+*.o
+*.obj
+*.out
+*.exe
+*.dll
+*.so
+*.dylib
+dpi_engine
+
+# Generated captures
+output.pcap

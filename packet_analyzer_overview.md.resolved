@@ -1,0 +1,229 @@
+# 📦 Packet Analyzer — Complete Project Overview
+
+## What Is This Project?
+
+This is a **Deep Packet Inspection (DPI) Engine** written in **C++17**. It reads network traffic captures (`.pcap` files), inspects every packet down to the application layer, classifies traffic by app (YouTube, Facebook, etc.), applies blocking rules, and writes filtered output.
+
+> Think of it as a mini-ISP firewall/traffic classifier you can run yourself.
+
+---
+
+## Tech Stack
+
+| Aspect | Detail |
+|---|---|
+| Language | C++17 |
+| Build System | CMake 3.16+ (also raw `g++` commands) |
+| External Dependencies | **None** — pure stdlib + OS headers |
+| Platform | macOS / Linux (Windows setup docs included) |
+| Input/Output Format | `.pcap` (Wireshark capture files) |
+
+---
+
+## Project File Map
+
+```
+Packet_analyzer-main/
+├── CMakeLists.txt            ← CMake build config (basic version)
+├── README.md                 ← Very detailed documentation (must-read)
+├── WINDOWS_SETUP.md          ← Windows build instructions
+├── generate_test_pcap.py     ← Python script to generate test .pcap files
+├── test_dpi.pcap             ← Sample input capture
+├── output.pcap               ← Sample output (filtered capture)
+├── dpi_engine                ← Pre-built binary (macOS)
+│
+├── include/                  ← Header files (declarations)
+│   ├── types.h               ← Core data structures (FiveTuple, AppType, etc.)
+│   ├── packet_parser.h       ← Network protocol parsing
+│   ├── pcap_reader.h         ← PCAP file reading
+│   ├── sni_extractor.h       ← TLS/SNI & HTTP Host extraction
+│   ├── connection_tracker.h  ← Flow/connection state tracking
+│   ├── rule_manager.h        ← Blocking rules engine
+│   ├── fast_path.h           ← Fast Path worker thread
+│   ├── load_balancer.h       ← Load Balancer thread
+│   ├── thread_safe_queue.h   ← Thread-safe queue (producer-consumer)
+│   ├── dpi_engine.h          ← Main orchestrator
+│   └── platform.h            ← Portable byte-order helpers
+│
+└── src/                      ← Implementations
+    ├── main_working.cpp      ← ⭐ SIMPLE VERSION (single-threaded, start here)
+    ├── dpi_mt.cpp            ← ⭐ MULTI-THREADED VERSION (production)
+    ├── packet_parser.cpp     ← Ethernet/IP/TCP/UDP parsing
+    ├── pcap_reader.cpp       ← PCAP file I/O
+    ├── sni_extractor.cpp     ← SNI & HTTP host extraction logic
+    ├── types.cpp             ← AppType helpers, sniToAppType()
+    ├── connection_tracker.cpp← Flow state machine
+    ├── rule_manager.cpp      ← IP/App/Domain block lists
+    ├── fast_path.cpp         ← Worker thread logic
+    ├── load_balancer.cpp     ← Dispatcher thread logic
+    ├── main.cpp              ← CMake entry point (basic)
+    ├── main_dpi.cpp          ← Alternative entry point
+    ├── main_simple.cpp       ← Minimal entry point
+    └── types.cpp             ← Type utilities
+```
+
+---
+
+## Core Concepts You Need to Know
+
+### 1. The Five-Tuple
+
+Every network connection is uniquely identified by:
+
+| Field | Example |
+|---|---|
+| Source IP | `192.168.1.100` |
+| Destination IP | `172.217.14.206` |
+| Source Port | `54321` |
+| Destination Port | `443` (HTTPS) |
+| Protocol | TCP (6) or UDP (17) |
+
+All packets sharing the same five-tuple belong to the **same flow/connection**.
+
+### 2. SNI (Server Name Indication)
+
+Even though HTTPS is encrypted, the **domain name is sent in plaintext** during the TLS Client Hello handshake. This is what the engine extracts:
+
+```
+TLS Client Hello → Extensions → SNI → "www.youtube.com"
+```
+
+This is the **core trick** of DPI: identifying encrypted HTTPS traffic by its destination domain.
+
+### 3. Flow-Based Blocking
+
+The engine does **not** block packet-by-packet. It blocks at the **connection level**:
+
+```
+Packet 1 (SYN)           → forward (no info yet)
+Packet 2 (Client Hello)  → SNI detected → "youtube.com" → BLOCKED
+Packet 3+                → flow already marked BLOCKED → all dropped
+```
+
+---
+
+## Architecture: Two Versions
+
+### Simple Version (`main_working.cpp`) — Single-threaded
+Best for learning. Processes packets in a straight line:
+
+```
+Read PCAP → Parse Headers → Extract SNI → Check Rules → Forward/Drop → Report
+```
+
+### Multi-threaded Version (`dpi_mt.cpp`) — Production-ready
+
+```
+Reader Thread
+     │
+     ├─hash(5-tuple) % N─► LB0 Thread ─► FP0, FP1 Threads
+     └───────────────────► LB1 Thread ─► FP2, FP3 Threads
+                                               │
+                                         Output Queue
+                                               │
+                                        Writer Thread → output.pcap
+```
+
+- **Load Balancers (LB):** Dispatch packets to Fast Paths using consistent hashing
+- **Fast Paths (FP):** Each FP owns its own flow table — does the actual DPI
+- **Consistent Hashing:** Same 5-tuple always goes to same FP (critical for stateful tracking)
+- **TSQueue:** Thread-safe queue with `mutex` + `condition_variable` (no busy-spin)
+
+---
+
+## Key Data Structures
+
+### `FiveTuple` (in `types.h`)
+```cpp
+struct FiveTuple {
+    uint32_t src_ip, dst_ip;
+    uint16_t src_port, dst_port;
+    uint8_t  protocol;
+};
+```
+Has a custom hash (`FiveTupleHash`) for use in `unordered_map`.
+
+### `AppType` enum (in `types.h`)
+Detected applications: `UNKNOWN, HTTP, HTTPS, DNS, GOOGLE, YOUTUBE, FACEBOOK, TWITTER, INSTAGRAM, NETFLIX, AMAZON, MICROSOFT, APPLE, WHATSAPP, TELEGRAM, TIKTOK, SPOTIFY, ZOOM, DISCORD, GITHUB, CLOUDFLARE`
+
+### `Connection` (in `types.h`)
+Tracks per-flow state: SNI, AppType, connection state (NEW → ESTABLISHED → CLASSIFIED → BLOCKED → CLOSED), packet/byte counters, timestamps.
+
+### `DPIStats` (in `types.h`)
+Atomic counters: total packets, forwarded, dropped, TCP/UDP breakdown, active connections.
+
+---
+
+## Blocking Rules
+
+Three types, checked in order:
+
+| Rule Type | Example | Effect |
+|---|---|---|
+| IP Blacklist | `--block-ip 192.168.1.50` | Block all traffic from that IP |
+| App Blacklist | `--block-app YouTube` | Block all YouTube connections |
+| Domain Blacklist | `--block-domain tiktok` | Block any SNI containing "tiktok" |
+
+---
+
+## How to Build & Run
+
+### Build (Simple Version)
+```bash
+g++ -std=c++17 -O2 -I include -o dpi_simple \
+    src/main_working.cpp src/pcap_reader.cpp \
+    src/packet_parser.cpp src/sni_extractor.cpp src/types.cpp
+```
+
+### Build (Multi-threaded)
+```bash
+g++ -std=c++17 -pthread -O2 -I include -o dpi_engine \
+    src/dpi_mt.cpp src/pcap_reader.cpp \
+    src/packet_parser.cpp src/sni_extractor.cpp src/types.cpp
+```
+
+### Run
+```bash
+./dpi_engine test_dpi.pcap output.pcap
+./dpi_engine test_dpi.pcap output.pcap --block-app YouTube --block-domain tiktok
+./dpi_engine input.pcap output.pcap --lbs 4 --fps 4   # thread count
+```
+
+### Generate Test Data
+```bash
+python3 generate_test_pcap.py   # creates test_dpi.pcap
+```
+
+---
+
+## Packet Parsing Pipeline (per packet)
+
+1. **Ethernet Header** (14 bytes) → extract MACs, EtherType
+2. **IPv4 Header** (20+ bytes) → extract src/dst IPs, protocol, TTL
+3. **TCP Header** (20+ bytes) → extract ports, seq/ack numbers, flags
+   or **UDP Header** (8 bytes) → extract ports
+4. **Payload** → passed to SNI/HTTP extractor
+5. **SNI Extraction** (TLS port 443) → parse TLS Client Hello → find extension type `0x0000` → extract hostname
+6. **HTTP Host** (port 80) → find `"Host: "` header in plaintext payload
+7. **Flow lookup** → `unordered_map<FiveTuple, Connection>`
+8. **Rule check** → forward or drop
+
+---
+
+## Important Technical Notes
+
+- **Network Byte Order:** Uses `ntohs()`/`ntohl()` (wrapped in portable `PortableNet::netToHost16/32`)
+- **No `libpcap`** — the engine implements its own PCAP file parser from scratch
+- **CMakeLists.txt is minimal** — only compiles the basic `main.cpp`. The README's `g++` commands are the proper build method
+- **`dpi_engine` binary in root** — there's a pre-built macOS binary ready to run
+- **Bidirectional flows** — `FiveTuple::reverse()` exists but flow tracking is primarily direction-aware
+
+---
+
+## What To Start With
+
+1. Read `include/types.h` — understand all data structures
+2. Read `src/main_working.cpp` — the simple end-to-end flow
+3. Read `src/packet_parser.cpp` (you're already here!)
+4. Read `src/sni_extractor.cpp` — the core DPI logic
+5. Then tackle `src/dpi_mt.cpp` for the threaded architecture
